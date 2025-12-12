@@ -1,0 +1,58 @@
+services:
+  - type: web
+    name: agent-report-scraper
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: BROWSER_HEADLESS
+        value: "true"
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
+      - key: SCRAPER_USERNAME
+        sync: false
+      - key: SCRAPER_PASSWORD
+        sync: false
+      # MongoDB Configuration
+      - key: MONGODB_CONNECTION_STRING
+        sync: false
+      - key: MONGODB_DATABASE
+        value: "agent_reports"
+      - key: MONGODB_COLLECTION
+        value: "reports"
+      - key: MONGODB_AGENTS_COLLECTION
+        value: "agents"
+
+  - type: cron
+    name: daily-scraper-cron
+    env: docker
+    dockerfilePath: ./Dockerfile
+    schedule: "0 2 * * *" # Run daily at 2 AM UTC
+    buildCommand: chmod +x daily_scraper.py
+    startCommand: python daily_scraper.py
+    plan: starter
+    envVars:
+      - key: API_BASE_URL
+        value: "https://agent-report-scraper.onrender.com"  # Replace with your actual Render app URL
+      - key: DAILY_SCRAPE_MAX_AGENTS
+        value: "0"  # 0 = no limit, process all agents for daily scraping
+      - key: BROWSER_HEADLESS
+        value: "true"
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
+      - key: SCRAPER_USERNAME
+        sync: false
+      - key: SCRAPER_PASSWORD
+        sync: false
+      # MongoDB Configuration
+      - key: MONGODB_CONNECTION_STRING
+        sync: false
+      - key: MONGODB_DATABASE
+        value: "agent_reports"
+      - key: MONGODB_COLLECTION
+        value: "reports"
+      - key: MONGODB_AGENTS_COLLECTION
+        value: "agents"
