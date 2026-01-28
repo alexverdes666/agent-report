@@ -17,8 +17,10 @@ from config import BASE_URL, BROWSER_CONFIG, SCRAPING_CONFIG, OUTPUT_CONFIG, AUT
 
 
 class AgentReportScraper:
-    def __init__(self):
+    def __init__(self, target_year=None, target_month=None):
         self.scraped_data = []
+        self.target_year = target_year
+        self.target_month = target_month
 
     async def setup_browser(self, playwright):
         """Initialize browser with configuration."""
@@ -121,11 +123,11 @@ class AgentReportScraper:
 
                 current_url = page.url
                 if "agent_report" in current_url:
-                    print(f"✓ Successfully navigated directly to detailed report: {current_url}")
+                    print(f"[OK] Successfully navigated directly to detailed report: {current_url}")
                     return
 
             except Exception as e:
-                print(f"⚠ Direct navigation failed: {e}")
+                print(f"[WARN] Direct navigation failed: {e}")
 
             # Method 2: Try clicking the link in the dropdown menu
             print("Method 2: Attempting to click the dropdown link...")
@@ -135,7 +137,7 @@ class AgentReportScraper:
                 if await reports_dropdown.count() > 0:
                     await reports_dropdown.hover()
                     await page.wait_for_timeout(500)
-                    print("✓ Hovered over 'Справки' dropdown")
+                    print("[OK] Hovered over 'Справки' dropdown")
 
                     # Now find and click the detailed report link
                     detailed_link = page.locator('a:has-text("Детайлизирана справка")')
@@ -146,17 +148,17 @@ class AgentReportScraper:
 
                         current_url = page.url
                         if "agent_report" in current_url:
-                            print(f"✓ Successfully navigated via dropdown to: {current_url}")
+                            print(f"[OK] Successfully navigated via dropdown to: {current_url}")
                             return
                         else:
-                            print(f"⚠ Unexpected URL after dropdown click: {current_url}")
+                            print(f"[WARN] Unexpected URL after dropdown click: {current_url}")
                     else:
-                        print("⚠ Could not find 'Детайлизирана справка' link")
+                        print("[WARN] Could not find 'Детайлизирана справка' link")
                 else:
-                    print("⚠ Could not find 'Справки' dropdown")
+                    print("[WARN] Could not find 'Справки' dropdown")
 
             except Exception as e:
-                print(f"⚠ Dropdown navigation failed: {e}")
+                print(f"[WARN] Dropdown navigation failed: {e}")
 
             # Method 3: Try finding the link by href attribute
             print("Method 3: Attempting to find link by href...")
@@ -169,21 +171,115 @@ class AgentReportScraper:
 
                     current_url = page.url
                     if "agent_report" in current_url:
-                        print(f"✓ Successfully navigated via href to: {current_url}")
+                        print(f"[OK] Successfully navigated via href to: {current_url}")
                         return
                     else:
-                        print(f"⚠ Unexpected URL after href click: {current_url}")
+                        print(f"[WARN] Unexpected URL after href click: {current_url}")
                 else:
-                    print("⚠ Could not find link with href containing 'agent_report'")
+                    print("[WARN] Could not find link with href containing 'agent_report'")
 
             except Exception as e:
-                print(f"⚠ Href navigation failed: {e}")
+                print(f"[WARN] Href navigation failed: {e}")
 
             # If all methods fail
-            print("⚠ All navigation methods failed")
+            print("[WARN] All navigation methods failed")
 
         except Exception as e:
             print(f"Error in navigate_to_reports: {e}")
+
+    async def set_date_range(self, page):
+        """Set the date range filter for a specific month."""
+        if not self.target_year or not self.target_month:
+            print("No target date specified, using default date range on page")
+            return True
+
+        try:
+            print(f"Setting date range for {self.target_year}-{self.target_month:02d}...")
+
+            # Calculate first and last day of the target month
+            first_day = datetime(self.target_year, self.target_month, 1)
+            # Get last day of month by going to first day of next month and subtracting one day
+            if self.target_month == 12:
+                last_day = datetime(self.target_year + 1, 1, 1) - pd.Timedelta(days=1)
+            else:
+                last_day = datetime(self.target_year, self.target_month + 1, 1) - pd.Timedelta(days=1)
+
+            # Format dates as expected by the form (DD/MM/YYYY)
+            date_from_str = first_day.strftime("%d/%m/%Y")
+            date_to_str = last_day.strftime("%d/%m/%Y")
+
+            print(f"Date range: {date_from_str} to {date_to_str}")
+
+            # Wait for the date input fields to be available
+            await page.wait_for_selector('#f_date_from', timeout=10000)
+            await page.wait_for_selector('#f_date_to', timeout=10000)
+
+            # Set dates using JavaScript to bypass datepicker
+            await page.evaluate(f"""
+                () => {{
+                    document.getElementById('f_date_from').value = '{date_from_str}';
+                    document.getElementById('f_date_to').value = '{date_to_str}';
+                }}
+            """)
+            print(f"[OK] Set date_from to: {date_from_str}")
+            print(f"[OK] Set date_to to: {date_to_str}")
+
+            # Click the search button or call FindRows()
+            try:
+                # Try clicking the search button first
+                search_button = page.locator('button.btn-info[onclick="FindRows()"]')
+                if await search_button.count() > 0:
+                    await search_button.click()
+                    print("[OK] Clicked search button (FindRows)")
+                else:
+                    # Fallback: call FindRows() directly via JavaScript
+                    await page.evaluate("FindRows()")
+                    print("[OK] Called FindRows() via JavaScript")
+            except Exception as e:
+                print(f"[WARN] Could not click search button: {e}")
+                # Last resort: try ChangePage(1)
+                try:
+                    await page.evaluate("ChangePage(1)")
+                    print("[OK] Called ChangePage(1) as fallback")
+                except Exception:
+                    pass
+
+            # Wait for AJAX request to complete and page to reload with new data
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(8000)  # Longer wait for AJAX data to load
+
+            # Wait for table data to be reloaded - try multiple selectors
+            try:
+                # Try different selectors for the table rows
+                selectors = [
+                    'table.blueTable tbody tr.edit_rows',
+                    'table.blueTable tbody tr',
+                    '#page table tbody tr',
+                    'table tbody tr'
+                ]
+                found = False
+                for selector in selectors:
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000)
+                        row_count = await page.locator(selector).count()
+                        if row_count > 0:
+                            print(f"[OK] Found {row_count} rows with selector: {selector}")
+                            found = True
+                            break
+                    except Exception:
+                        continue
+                if not found:
+                    print("[WARN] Could not find table rows after setting date range")
+                await page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"[WARN] Error waiting for table: {e}")
+
+            print(f"[OK] Date range set successfully for {self.target_year}-{self.target_month:02d}")
+            return True
+
+        except Exception as e:
+            print(f"[WARN] Error setting date range: {e}")
+            return False
 
     async def extract_data(self, page):
         """Extract data from the current page."""
@@ -202,7 +298,7 @@ class AgentReportScraper:
 
             # Check if we're on the detailed report page (agent_report)
             if "agent_report" in url or "Детайлизирана справка" in text_content:
-                print("✓ Detected detailed report page - extracting agent data...")
+                print("[OK] Detected detailed report page - extracting agent data...")
                 # Extract data from all pages if pagination exists
                 all_agent_data = await self.extract_all_agent_pages(page)
 
@@ -222,7 +318,7 @@ class AgentReportScraper:
                     page_data["error"] = all_agent_data["error"]
 
             else:
-                print("ℹ General data extraction...")
+                print("[INFO] General data extraction...")
                 page_data = await self.extract_general_data(page)
 
             self.scraped_data.append(page_data)
@@ -243,6 +339,25 @@ class AgentReportScraper:
 
             # Wait for table to be fully loaded
             await page.wait_for_selector('table.blueTable', timeout=10000)
+
+            # Wait for table rows to be present (try multiple selectors)
+            selectors = [
+                'table.blueTable tbody tr.edit_rows',
+                'table.blueTable tbody tr[class*="edit"]',
+                'table.blueTable tbody tr'
+            ]
+            for selector in selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=5000)
+                    row_count = await page.locator(selector).count()
+                    if row_count > 0:
+                        print(f"[INFO] Using row selector: {selector} ({row_count} rows)")
+                        break
+                except Exception:
+                    continue
+
+            # Additional wait to ensure JavaScript rendering is complete
+            await page.wait_for_timeout(2000)
 
             # Extract the agent report table data with improved logic
             agent_data = await page.evaluate("""
@@ -417,13 +532,13 @@ class AgentReportScraper:
 
             # Log extraction results
             if agent_data and agent_data['table_found']:
-                print(f"✓ Successfully extracted data for {agent_data['total_rows']} agents")
+                print(f"[OK] Successfully extracted data for {agent_data['total_rows']} agents")
                 for i, row in enumerate(agent_data['rows'][:3]):  # Show first 3 agents
                     print(f"  Agent {i+1}: {row['agent_number']} - {row['agent_name']}")
                 if agent_data['total_rows'] > 3:
                     print(f"  ... and {agent_data['total_rows'] - 3} more agents")
             else:
-                print("⚠ No agent data extracted or table not found")
+                print("[WARN] No agent data extracted or table not found")
 
             return {
                 "timestamp": datetime.now().isoformat(),
@@ -518,7 +633,7 @@ class AgentReportScraper:
                     if pagination.get('total_pages'):
                         total_pages = pagination['total_pages']
 
-                    print(f"✓ Extracted {len(agents_on_page)} agents from page {current_page}")
+                    print(f"[OK] Extracted {len(agents_on_page)} agents from page {current_page}")
 
                     # Check if there are more pages
                     if current_page < total_pages:
@@ -536,7 +651,7 @@ class AgentReportScraper:
                 # Add delay between pages
                 await page.wait_for_timeout(1000)
 
-            print(f"✓ Total agents extracted: {len(all_agents)} from {current_page - 1} pages")
+            print(f"[OK] Total agents extracted: {len(all_agents)} from {current_page - 1} pages")
 
             return {
                 "all_agents": all_agents,
@@ -558,21 +673,24 @@ class AgentReportScraper:
     async def navigate_to_next_page(self, page, page_number):
         """Navigate to a specific page in the agent table pagination."""
         try:
-            # Method 1: Try clicking the page number link
-            page_link = page.locator(f'a:has-text("{page_number}")')
-            if await page_link.count() > 0:
-                await page_link.click()
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(2000)
-                return True
-
-            # Method 2: Try using the JavaScript ChangePage function
+            # Method 1: Use JavaScript ChangePage function directly (most reliable)
             await page.evaluate(f'ChangePage({page_number})')
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(2000)
             return True
 
         except Exception as e:
+            try:
+                # Method 2: Try clicking the page link in the pagination area (tfoot)
+                page_link = page.locator(f'tfoot a[onclick*="ChangePage(\'{page_number}\')"]')
+                if await page_link.count() > 0:
+                    await page_link.click()
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(2000)
+                    return True
+            except Exception:
+                pass
+
             print(f"Error navigating to page {page_number}: {e}")
             return False
 
@@ -596,6 +714,9 @@ class AgentReportScraper:
 
                 # Navigate to the specific report section
                 await self.navigate_to_reports(page)
+
+                # Set the date range if target month is specified
+                await self.set_date_range(page)
 
                 # Extract data from the main page
                 await self.extract_data(page)
@@ -699,7 +820,7 @@ class AgentReportScraper:
             
             await page.wait_for_timeout(1000)  # Wait for modal to close
             
-            print(f"✓ Extracted {len(incoming_calls)} incoming and {len(outgoing_calls)} outgoing calls for agent {agent_number}")
+            print(f"[OK] Extracted {len(incoming_calls)} incoming and {len(outgoing_calls)} outgoing calls for agent {agent_number}")
             
             return {
                 "agent_number": agent_number,
@@ -710,7 +831,7 @@ class AgentReportScraper:
             }
             
         except Exception as e:
-            print(f"⚠ Error extracting call details for agent {agent_number}: {e}")
+            print(f"[WARN] Error extracting call details for agent {agent_number}: {e}")
             return {
                 "agent_number": agent_number,
                 "agent_name": agent_name,
@@ -742,13 +863,13 @@ class AgentReportScraper:
                 basic_data = await self.extract_agent_report_data(page)
                 
                 if not basic_data or not basic_data.get('extraction_successful'):
-                    print("⚠ Failed to extract basic agent data")
+                    print("[WARN] Failed to extract basic agent data")
                     return self.scraped_data
 
                 agents = basic_data.get('agent_data', {}).get('rows', [])
                 
                 if not agents:
-                    print("⚠ No agents found")
+                    print("[WARN] No agents found")
                     return self.scraped_data
 
                 # Limit agents if specified
@@ -780,7 +901,7 @@ class AgentReportScraper:
                         await page.wait_for_timeout(1000)
                         
                     except Exception as e:
-                        print(f"⚠ Error processing agent {agent.get('agent_number', 'unknown')}: {e}")
+                        print(f"[WARN] Error processing agent {agent.get('agent_number', 'unknown')}: {e}")
                         # Add agent without call details
                         enhanced_agents.append({
                             **agent,
@@ -810,7 +931,7 @@ class AgentReportScraper:
                 
                 self.scraped_data = [enhanced_data]
                 
-                print(f"✓ Enhanced scraping completed for {len(enhanced_agents)} agents")
+                print(f"[OK] Enhanced scraping completed for {len(enhanced_agents)} agents")
                 
                 return self.scraped_data
 

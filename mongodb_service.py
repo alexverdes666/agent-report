@@ -193,13 +193,15 @@ class MongoDBService:
             return doc.isoformat()
         return doc
 
-    def save_report(self, report_data: List[Dict], task_id: str) -> str:
+    def save_report(self, report_data: List[Dict], task_id: str, target_year: int = None, target_month: int = None) -> str:
         """
         Save a complete report to MongoDB with monthly organization.
 
         Args:
             report_data: List of report data (as loaded from JSON)
             task_id: Unique task identifier
+            target_year: Optional target year for historical data (defaults to current year)
+            target_month: Optional target month for historical data (defaults to current month)
 
         Returns:
             str: Document ID of the saved report
@@ -207,21 +209,28 @@ class MongoDBService:
         try:
             current_time = datetime.utcnow()
 
+            # Use target year/month if provided, otherwise use current date
+            report_year = target_year if target_year else current_time.year
+            report_month = target_month if target_month else current_time.month
+
+            # Create a date object for the report period
+            report_date = datetime(report_year, report_month, 1)
+
             # Prepare document with monthly fields
             document = {
                 "task_id": task_id,
                 "saved_at": current_time,
                 "report_count": len(report_data),
                 "reports": report_data,
-                # Monthly organization fields
-                "year": current_time.year,
-                "month": current_time.month,
-                "month_year": f"{current_time.year}-{current_time.month:02d}",
+                # Monthly organization fields - use target date
+                "year": report_year,
+                "month": report_month,
+                "month_year": f"{report_year}-{report_month:02d}",
                 "period": {
-                    "year": current_time.year,
-                    "month": current_time.month,
-                    "month_name": current_time.strftime("%B"),
-                    "month_year_display": current_time.strftime("%B %Y")
+                    "year": report_year,
+                    "month": report_month,
+                    "month_name": report_date.strftime("%B"),
+                    "month_year_display": report_date.strftime("%B %Y")
                 }
             }
 

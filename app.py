@@ -11,6 +11,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
 import threading
+import pandas as pd
 
 from scraper import AgentReportScraper
 from mongodb_service import get_mongodb_service
@@ -31,14 +32,25 @@ def home():
     return jsonify({
         "status": "running",
         "message": "Agent Report Scraper API with MongoDB Integration",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "environment_check": {
             "has_username": bool(os.environ.get('SCRAPER_USERNAME')),
             "has_password": bool(os.environ.get('SCRAPER_PASSWORD')),
             "mongodb_configured": bool(os.environ.get('MONGODB_CONNECTION_STRING'))
         },
         "endpoints": {
-            "scrape": "/api/scrape",
+            "scrape": {
+                "url": "/api/scrape",
+                "method": "POST or GET",
+                "description": "Start a scraping task. Supports historical data scraping up to 12 months back.",
+                "parameters": {
+                    "year": "Target year (e.g., 2025) - optional, defaults to current year",
+                    "month": "Target month (1-12) - optional, defaults to current month",
+                    "username": "Login username - optional, uses env var if not provided",
+                    "password": "Login password - optional, uses env var if not provided"
+                },
+                "example": "/api/scrape?year=2025&month=1"
+            },
             "mongodb": {
                 "all_agents": "/api/mongodb/agents",
                 "agent_by_name": "/api/mongodb/agents/<agent_name>",
@@ -65,8 +77,6 @@ def start_scraping():
         logger.info(f"Request headers: {dict(request.headers)}")
         logger.info(f"Request is_json: {request.is_json}")
         logger.info(f"Request has form data: {bool(request.form)}")
-        # Generate unique task ID
-        task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # Get optional parameters from request (handle both JSON and form data)
         data = {}
@@ -82,6 +92,27 @@ def start_scraping():
         except Exception:
             # If JSON parsing fails, continue with empty data
             data = {}
+
+        # Also check query parameters for GET requests
+        if request.method == 'GET':
+            data.update(request.args.to_dict())
+
+        # Get target year and month (for scraping historical data)
+        target_year = data.get('year')
+        target_month = data.get('month')
+
+        # Convert to int if provided
+        if target_year:
+            target_year = int(target_year)
+        if target_month:
+            target_month = int(target_month)
+
+        # Generate unique task ID including the target month if specified
+        if target_year and target_month:
+            task_id = f"task_{target_year}{target_month:02d}_{datetime.now().strftime('%H%M%S')}"
+            logger.info(f"Scraping historical data for {target_year}-{target_month:02d}")
+        else:
+            task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # Get credentials from request data or use environment variables
         username = data.get('username') or os.environ.get('SCRAPER_USERNAME')
@@ -105,7 +136,7 @@ def start_scraping():
         }
 
         # Start scraping in background
-        def run_scraper():
+        def run_scraper(year=None, month=None):
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -113,8 +144,10 @@ def start_scraping():
                 scraper_results[task_id]["status"] = "running"
                 scraper_results[task_id]["progress"] = 10
                 scraper_results[task_id]["message"] = "Browser starting..."
+                if year and month:
+                    scraper_results[task_id]["target_period"] = f"{year}-{month:02d}"
 
-                scraper = AgentReportScraper()
+                scraper = AgentReportScraper(target_year=year, target_month=month)
                 loop.run_until_complete(scraper.scrape())
 
                 # Check if data was scraped successfully
@@ -128,10 +161,11 @@ def start_scraping():
                     # Save to MongoDB
                     try:
                         mongodb_service = get_mongodb_service()
-                        document_id = mongodb_service.save_report(scraper.scraped_data, task_id)
+                        document_id = mongodb_service.save_report(scraper.scraped_data, task_id, target_year=year, target_month=month)
                         scraper_results[task_id]["mongodb_id"] = document_id
-                        scraper_results[task_id]["message"] += f" | Saved to MongoDB: {document_id}"
-                        logger.info(f"Scraping data saved to MongoDB: {document_id}")
+                        period_info = f" for {year}-{month:02d}" if year and month else ""
+                        scraper_results[task_id]["message"] += f" | Saved to MongoDB: {document_id}{period_info}"
+                        logger.info(f"Scraping data saved to MongoDB: {document_id}{period_info}")
                     except Exception as mongo_error:
                         logger.error(f"MongoDB save failed: {mongo_error}")
                         scraper_results[task_id]["mongodb_error"] = str(mongo_error)
@@ -151,16 +185,20 @@ def start_scraping():
                 loop.close()
 
         # Start background task
-        thread = threading.Thread(target=run_scraper)
+        thread = threading.Thread(target=run_scraper, kwargs={'year': target_year, 'month': target_month})
         thread.daemon = True
         thread.start()
 
-        return jsonify({
+        response_data = {
             "success": True,
             "task_id": task_id,
             "message": "Scraping started successfully",
             "status_url": f"/api/results/{task_id}"
-        }), 202
+        }
+        if target_year and target_month:
+            response_data["target_period"] = f"{target_year}-{target_month:02d}"
+
+        return jsonify(response_data), 202
 
     except Exception as e:
         logger.error(f"Error starting scraping: {e}")
@@ -441,6 +479,148 @@ def cleanup_bonus_fields():
         })
     except Exception as e:
         logger.error(f"Error cleaning up bonus fields: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route('/api/scrape/historical', methods=['POST', 'GET'])
+def scrape_historical():
+    """
+    Start scraping tasks for multiple months going back from current date.
+
+    Parameters:
+        months_back: Number of months to go back (default: 12, max: 24)
+
+    Returns:
+        List of task IDs for each month being scraped
+    """
+    try:
+        # Get parameters
+        data = {}
+        try:
+            if request.is_json:
+                data = request.get_json() or {}
+            elif request.form:
+                data = request.form.to_dict()
+        except Exception:
+            data = {}
+
+        if request.method == 'GET':
+            data.update(request.args.to_dict())
+
+        months_back = int(data.get('months_back', 12))
+        months_back = min(months_back, 24)  # Cap at 24 months
+
+        # Get credentials
+        username = data.get('username') or os.environ.get('SCRAPER_USERNAME')
+        password = data.get('password') or os.environ.get('SCRAPER_PASSWORD')
+
+        if data.get('username') and data.get('password'):
+            os.environ['SCRAPER_USERNAME'] = data.get('username')
+            os.environ['SCRAPER_PASSWORD'] = data.get('password')
+
+        # Calculate months to scrape
+        current_date = datetime.now()
+        months_to_scrape = []
+
+        for i in range(months_back):
+            # Calculate the target month
+            target_date = current_date - pd.DateOffset(months=i)
+            months_to_scrape.append({
+                'year': target_date.year,
+                'month': target_date.month
+            })
+
+        tasks = []
+
+        for month_info in months_to_scrape:
+            year = month_info['year']
+            month = month_info['month']
+            task_id = f"task_{year}{month:02d}_{datetime.now().strftime('%H%M%S')}"
+
+            # Initialize scraper result
+            scraper_results[task_id] = {
+                "status": "queued",
+                "created_at": datetime.now().isoformat(),
+                "progress": 0,
+                "message": f"Queued for {year}-{month:02d}",
+                "task_id": task_id,
+                "target_period": f"{year}-{month:02d}"
+            }
+
+            tasks.append({
+                "task_id": task_id,
+                "year": year,
+                "month": month,
+                "status_url": f"/api/results/{task_id}"
+            })
+
+        # Start a background thread that processes each month sequentially
+        def run_historical_scraping(tasks_list):
+            for task_info in tasks_list:
+                task_id = task_info['task_id']
+                year = task_info['year']
+                month = task_info['month']
+
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    scraper_results[task_id]["status"] = "running"
+                    scraper_results[task_id]["progress"] = 10
+                    scraper_results[task_id]["message"] = f"Scraping {year}-{month:02d}..."
+
+                    scraper = AgentReportScraper(target_year=year, target_month=month)
+                    loop.run_until_complete(scraper.scrape())
+
+                    if scraper.scraped_data:
+                        scraper_results[task_id]["status"] = "completed"
+                        scraper_results[task_id]["progress"] = 100
+                        scraper_results[task_id]["data_count"] = len(scraper.scraped_data)
+                        scraper_results[task_id]["scraped_data"] = scraper.scraped_data
+
+                        try:
+                            mongodb_service = get_mongodb_service()
+                            document_id = mongodb_service.save_report(
+                                scraper.scraped_data, task_id,
+                                target_year=year, target_month=month
+                            )
+                            scraper_results[task_id]["mongodb_id"] = document_id
+                            scraper_results[task_id]["message"] = f"Completed {year}-{month:02d} | MongoDB: {document_id}"
+                        except Exception as mongo_error:
+                            scraper_results[task_id]["mongodb_error"] = str(mongo_error)
+                            scraper_results[task_id]["message"] = f"Completed {year}-{month:02d} (MongoDB error)"
+                    else:
+                        scraper_results[task_id]["status"] = "completed"
+                        scraper_results[task_id]["progress"] = 100
+                        scraper_results[task_id]["message"] = f"No data found for {year}-{month:02d}"
+                        scraper_results[task_id]["data_count"] = 0
+
+                    loop.close()
+
+                except Exception as e:
+                    scraper_results[task_id]["status"] = "error"
+                    scraper_results[task_id]["message"] = f"Error scraping {year}-{month:02d}: {str(e)}"
+                    logger.error(f"Historical scraping error for {year}-{month}: {e}")
+
+                # Add delay between months to avoid overwhelming the server
+                import time
+                time.sleep(5)
+
+        thread = threading.Thread(target=run_historical_scraping, args=(tasks,))
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({
+            "success": True,
+            "message": f"Started historical scraping for {months_back} months",
+            "months_back": months_back,
+            "tasks": tasks
+        }), 202
+
+    except Exception as e:
+        logger.error(f"Error starting historical scraping: {e}")
         return jsonify({
             "success": False,
             "error": str(e)
