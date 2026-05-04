@@ -240,10 +240,14 @@ class MongoDBService:
                 # Handle both basic and enhanced scraping data structures
                 if "all_agents" in report:
                     # Basic scraping structure
-                    agents_saved += self._save_agents_from_report(report, task_id)
+                    agents_saved += self._save_agents_from_report(
+                        report, task_id, target_year=target_year, target_month=target_month
+                    )
                 elif "agent_data" in report and "rows" in report["agent_data"]:
                     # Enhanced scraping structure
-                    agents_saved += self._save_enhanced_agents_from_report(report, task_id)
+                    agents_saved += self._save_enhanced_agents_from_report(
+                        report, task_id, target_year=target_year, target_month=target_month
+                    )
 
             # Save the complete report
             result = self.reports_collection.insert_one(document)
@@ -255,13 +259,16 @@ class MongoDBService:
             logger.error(f"Error saving report: {e}")
             raise
 
-    def _save_agents_from_report(self, report: Dict, task_id: str) -> int:
+    def _save_agents_from_report(self, report: Dict, task_id: str,
+                                  target_year: int = None, target_month: int = None) -> int:
         """
         Extract and save individual agent records from a report with monthly organization.
 
         Args:
             report: Single report dictionary
             task_id: Task identifier
+            target_year: Optional explicit year for the period these agents belong to
+            target_month: Optional explicit month for the period these agents belong to
 
         Returns:
             int: Number of agents processed
@@ -271,8 +278,12 @@ class MongoDBService:
         try:
             current_time = datetime.utcnow()
 
-            # Extract the report date for proper monthly organization
-            report_date = self._extract_report_date(report, task_id)
+            # When the caller specifies the period, trust it — re-scrapes of past
+            # months must land under that month, not under datetime.now().
+            if target_year and target_month:
+                report_date = datetime(target_year, target_month, 1)
+            else:
+                report_date = self._extract_report_date(report, task_id)
 
             for agent in report.get("all_agents", []):
                 agent_doc = {
@@ -314,7 +325,8 @@ class MongoDBService:
 
         return agents_processed
 
-    def _save_enhanced_agents_from_report(self, report: Dict, task_id: str) -> int:
+    def _save_enhanced_agents_from_report(self, report: Dict, task_id: str,
+                                           target_year: int = None, target_month: int = None) -> int:
         """
         Extract and save individual agent records from an enhanced report with monthly organization.
         Handles enhanced data with call_details.
@@ -322,6 +334,8 @@ class MongoDBService:
         Args:
             report: Enhanced report dictionary
             task_id: Task identifier
+            target_year: Optional explicit year for the period these agents belong to
+            target_month: Optional explicit month for the period these agents belong to
 
         Returns:
             int: Number of agents processed
@@ -331,8 +345,10 @@ class MongoDBService:
         try:
             current_time = datetime.utcnow()
 
-            # Extract the report date for proper monthly organization
-            report_date = self._extract_report_date(report, task_id)
+            if target_year and target_month:
+                report_date = datetime(target_year, target_month, 1)
+            else:
+                report_date = self._extract_report_date(report, task_id)
 
             agents = report.get("agent_data", {}).get("rows", [])
 

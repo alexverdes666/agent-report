@@ -803,10 +803,15 @@ def repair_task(task_id):
         # Count agents before repair
         agents_before = mongodb_service.agents_collection.count_documents({"task_id": task_id})
 
-        # Re-process the report data
+        # Re-process the report data — pass through the report's stored period
+        # so agents land under the same year/month the report was filed for.
+        repair_year = report_doc.get("year")
+        repair_month = report_doc.get("month")
         agents_processed = 0
         for report in report_doc.get("reports", []):
-            agents_processed += mongodb_service._save_agents_from_report(report, task_id)
+            agents_processed += mongodb_service._save_agents_from_report(
+                report, task_id, target_year=repair_year, target_month=repair_month
+            )
 
         # Count agents after repair
         agents_after = mongodb_service.agents_collection.count_documents({"task_id": task_id})
@@ -1099,13 +1104,18 @@ def repair_month(year, month):
             # Count agents for this task before repair
             agents_before = mongodb_service.agents_collection.count_documents({"task_id": task_id})
 
-            # Re-process the report data
+            # Re-process the report data — explicit year/month from the URL
+            # ensures agents are upserted under the correct period.
             agents_processed = 0
             for report in report_doc.get("reports", []):
                 if "all_agents" in report:
-                    agents_processed += mongodb_service._save_agents_from_report(report, task_id)
+                    agents_processed += mongodb_service._save_agents_from_report(
+                        report, task_id, target_year=year, target_month=month
+                    )
                 elif "agent_data" in report and "rows" in report["agent_data"]:
-                    agents_processed += mongodb_service._save_enhanced_agents_from_report(report, task_id)
+                    agents_processed += mongodb_service._save_enhanced_agents_from_report(
+                        report, task_id, target_year=year, target_month=month
+                    )
 
             # Count agents for this task after repair
             agents_after = mongodb_service.agents_collection.count_documents({"task_id": task_id})
