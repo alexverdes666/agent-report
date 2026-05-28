@@ -5,8 +5,9 @@ Provides only essential API endpoints for external software integration.
 
 import os
 import asyncio
+import atexit
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
@@ -25,6 +26,84 @@ CORS(app, origins=["*"], allow_headers=["Content-Type", "Authorization", "Accept
 
 # Store scraper instances and results
 scraper_results = {}
+
+
+def _new_task_id(target_year=None, target_month=None):
+    """Build a task_id matching the convention used by /api/scrape."""
+    if target_year and target_month:
+        return f"task_{target_year}{target_month:02d}_{datetime.now().strftime('%H%M%S')}"
+    return f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def run_scrape_sync(target_year=None, target_month=None, source="manual"):
+    """
+    Synchronously execute a scrape and persist the result.
+
+    Shared by the /api/scrape endpoint (called inside a worker thread) and
+    the in-process APScheduler so both code paths produce identical state in
+    `scraper_results` and MongoDB. Returns the task_id either way.
+    """
+    task_id = _new_task_id(target_year, target_month)
+
+    scraper_results[task_id] = {
+        "status": "running",
+        "created_at": datetime.now().isoformat(),
+        "progress": 10,
+        "message": f"Browser starting ({source})...",
+        "task_id": task_id,
+        "source": source,
+    }
+    if target_year and target_month:
+        scraper_results[task_id]["target_period"] = f"{target_year}-{target_month:02d}"
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        scraper = AgentReportScraper(target_year=target_year, target_month=target_month)
+        loop.run_until_complete(scraper.scrape())
+
+        if scraper.scraped_data:
+            scraper_results[task_id].update({
+                "status": "completed",
+                "progress": 100,
+                "message": "Scraping completed successfully",
+                "data_count": len(scraper.scraped_data),
+                "scraped_data": scraper.scraped_data,
+            })
+
+            try:
+                mongodb_service = get_mongodb_service()
+                document_id = mongodb_service.save_report(
+                    scraper.scraped_data, task_id,
+                    target_year=target_year, target_month=target_month,
+                )
+                scraper_results[task_id]["mongodb_id"] = document_id
+                period_info = f" for {target_year}-{target_month:02d}" if target_year and target_month else ""
+                scraper_results[task_id]["message"] += f" | Saved to MongoDB: {document_id}{period_info}"
+                logger.info(f"[{source}] Scrape {task_id} saved to MongoDB: {document_id}{period_info}")
+            except Exception as mongo_error:
+                logger.error(f"[{source}] MongoDB save failed for {task_id}: {mongo_error}")
+                scraper_results[task_id]["mongodb_error"] = str(mongo_error)
+        else:
+            scraper_results[task_id].update({
+                "status": "completed",
+                "progress": 100,
+                "message": "Scraping completed but no data found",
+                "data_count": 0,
+            })
+            logger.warning(f"[{source}] Scrape {task_id} returned no data")
+
+    except Exception as e:
+        scraper_results[task_id].update({
+            "status": "error",
+            "progress": 0,
+            "message": f"Scraping failed: {e}",
+        })
+        logger.error(f"[{source}] Scrape {task_id} failed: {e}")
+    finally:
+        loop.close()
+
+    return task_id
 
 @app.route('/')
 def home():
@@ -107,12 +186,13 @@ def start_scraping():
         if target_month:
             target_month = int(target_month)
 
-        # Generate unique task ID including the target month if specified
+        # Pre-generate the task_id so we can return it immediately; the
+        # helper called inside the worker thread will use the same convention
+        # but it produces its own id. We pre-create the placeholder result so
+        # the client can poll right away, then the helper overwrites it.
+        task_id = _new_task_id(target_year, target_month)
         if target_year and target_month:
-            task_id = f"task_{target_year}{target_month:02d}_{datetime.now().strftime('%H%M%S')}"
             logger.info(f"Scraping historical data for {target_year}-{target_month:02d}")
-        else:
-            task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # Get credentials from request data or use environment variables
         username = data.get('username') or os.environ.get('SCRAPER_USERNAME')
@@ -126,66 +206,27 @@ def start_scraping():
             os.environ['SCRAPER_PASSWORD'] = data.get('password')
             logger.info("Updated environment variables with request credentials")
 
-        # Initialize scraper result
+        # Seed the result entry so polling works while the worker spins up.
+        # The helper overwrites under the same key on first update.
         scraper_results[task_id] = {
             "status": "starting",
             "created_at": datetime.now().isoformat(),
             "progress": 0,
             "message": "Initializing scraper...",
-            "task_id": task_id
+            "task_id": task_id,
+            "source": "api",
         }
 
-        # Start scraping in background
-        def run_scraper(year=None, month=None):
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+        # Hand off to the shared helper in a daemon thread so the request
+        # returns 202 immediately and the scrape runs in the background.
+        def _runner():
+            # Helper allocates its own task_id; copy the result back under the
+            # placeholder id we returned so the client's poll URL keeps working.
+            new_id = run_scrape_sync(target_year, target_month, source="api")
+            if new_id != task_id:
+                scraper_results[task_id] = scraper_results[new_id]
 
-                scraper_results[task_id]["status"] = "running"
-                scraper_results[task_id]["progress"] = 10
-                scraper_results[task_id]["message"] = "Browser starting..."
-                if year and month:
-                    scraper_results[task_id]["target_period"] = f"{year}-{month:02d}"
-
-                scraper = AgentReportScraper(target_year=year, target_month=month)
-                loop.run_until_complete(scraper.scrape())
-
-                # Check if data was scraped successfully
-                if scraper.scraped_data:
-                    scraper_results[task_id]["status"] = "completed"
-                    scraper_results[task_id]["progress"] = 100
-                    scraper_results[task_id]["message"] = "Scraping completed successfully"
-                    scraper_results[task_id]["data_count"] = len(scraper.scraped_data)
-                    scraper_results[task_id]["scraped_data"] = scraper.scraped_data
-
-                    # Save to MongoDB
-                    try:
-                        mongodb_service = get_mongodb_service()
-                        document_id = mongodb_service.save_report(scraper.scraped_data, task_id, target_year=year, target_month=month)
-                        scraper_results[task_id]["mongodb_id"] = document_id
-                        period_info = f" for {year}-{month:02d}" if year and month else ""
-                        scraper_results[task_id]["message"] += f" | Saved to MongoDB: {document_id}{period_info}"
-                        logger.info(f"Scraping data saved to MongoDB: {document_id}{period_info}")
-                    except Exception as mongo_error:
-                        logger.error(f"MongoDB save failed: {mongo_error}")
-                        scraper_results[task_id]["mongodb_error"] = str(mongo_error)
-
-                else:
-                    scraper_results[task_id]["status"] = "completed"
-                    scraper_results[task_id]["progress"] = 100
-                    scraper_results[task_id]["message"] = "Scraping completed but no data found"
-                    scraper_results[task_id]["data_count"] = 0
-
-            except Exception as e:
-                scraper_results[task_id]["status"] = "error"
-                scraper_results[task_id]["progress"] = 0
-                scraper_results[task_id]["message"] = f"Scraping failed: {str(e)}"
-                logger.error(f"Scraping error: {e}")
-            finally:
-                loop.close()
-
-        # Start background task
-        thread = threading.Thread(target=run_scraper, kwargs={'year': target_year, 'month': target_month})
+        thread = threading.Thread(target=_runner)
         thread.daemon = True
         thread.start()
 
@@ -1156,6 +1197,92 @@ def repair_month(year, month):
             "success": False,
             "error": str(e)
         }), 500
+
+
+def _last_scrape_age_hours():
+    """Hours since the most recently saved report (None if no reports / DB error)."""
+    try:
+        svc = get_mongodb_service()
+        latest = svc.reports_collection.find_one(sort=[("saved_at", -1)])
+        if not latest or not latest.get("saved_at"):
+            return None
+        saved = latest["saved_at"]
+        if saved.tzinfo is None:
+            saved = saved.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - saved).total_seconds() / 3600
+    except Exception as e:
+        logger.error(f"Could not read last-scrape age: {e}")
+        return None
+
+
+def _scheduled_daily_scrape():
+    """Cron job: scrape the current month."""
+    logger.info("[scheduler] Daily 02:00 UTC scrape firing")
+    run_scrape_sync(source="scheduler-daily")
+
+
+def _startup_self_heal():
+    """
+    Runs once ~30s after boot. If the most recent scrape is older than 23h,
+    fire one immediately so deploys that cross the 02:00 UTC window self-heal
+    instead of waiting for the next day.
+    """
+    try:
+        age = _last_scrape_age_hours()
+        if age is None:
+            logger.info("[scheduler] No prior scrape on record — running startup catch-up")
+            run_scrape_sync(source="scheduler-startup")
+            return
+        if age > 23:
+            logger.info(f"[scheduler] Last scrape was {age:.1f}h ago — running startup catch-up")
+            run_scrape_sync(source="scheduler-startup")
+        else:
+            logger.info(f"[scheduler] Last scrape was {age:.1f}h ago — skipping startup catch-up")
+    except Exception as e:
+        logger.error(f"[scheduler] Startup self-heal failed: {e}")
+
+
+def _start_scheduler():
+    """Boot APScheduler with the daily job + one-shot startup self-heal.
+
+    Gated on DISABLE_SCHEDULER for local dev/tests. Safe under gunicorn with
+    --workers 1 (the current Procfile); if workers > 1 is ever introduced,
+    move this behind a lockfile or external cron to avoid duplicate firings.
+    """
+    if os.environ.get("DISABLE_SCHEDULER", "").lower() in ("1", "true", "yes"):
+        logger.info("[scheduler] DISABLE_SCHEDULER set — not starting scheduler")
+        return
+
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError as e:
+        logger.error(f"[scheduler] APScheduler not installed: {e}")
+        return
+
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(
+        _scheduled_daily_scrape,
+        trigger=CronTrigger(hour=2, minute=0, timezone="UTC"),
+        id="daily_scrape_0200_utc",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        _startup_self_heal,
+        trigger="date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=30),
+        id="startup_self_heal",
+        max_instances=1,
+    )
+    scheduler.start()
+    atexit.register(lambda: scheduler.shutdown(wait=False))
+    logger.info("[scheduler] Started: daily 02:00 UTC + 30s startup self-heal")
+
+
+# Kick off the scheduler at module import time so it runs under gunicorn.
+_start_scheduler()
 
 
 if __name__ == '__main__':
