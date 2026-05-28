@@ -1242,6 +1242,9 @@ def _startup_self_heal():
         logger.error(f"[scheduler] Startup self-heal failed: {e}")
 
 
+_scheduler = None  # Module-level reference so /api/scheduler can introspect it.
+
+
 def _start_scheduler():
     """Boot APScheduler with the daily job + one-shot startup self-heal.
 
@@ -1249,6 +1252,7 @@ def _start_scheduler():
     --workers 1 (the current Procfile); if workers > 1 is ever introduced,
     move this behind a lockfile or external cron to avoid duplicate firings.
     """
+    global _scheduler
     if os.environ.get("DISABLE_SCHEDULER", "").lower() in ("1", "true", "yes"):
         logger.info("[scheduler] DISABLE_SCHEDULER set — not starting scheduler")
         return
@@ -1278,7 +1282,32 @@ def _start_scheduler():
     )
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown(wait=False))
+    _scheduler = scheduler
     logger.info("[scheduler] Started: daily 02:00 UTC + 30s startup self-heal")
+
+
+@app.route('/api/scheduler')
+def scheduler_status():
+    """Introspection endpoint — confirms the in-process scheduler is alive
+    and shows the next fire time for each job."""
+    if _scheduler is None:
+        return jsonify({
+            "running": False,
+            "reason": "scheduler not started (DISABLE_SCHEDULER set or APScheduler import failed)",
+        })
+    jobs = []
+    for job in _scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+            "trigger": str(job.trigger),
+        })
+    return jsonify({
+        "running": _scheduler.running,
+        "last_scrape_age_hours": _last_scrape_age_hours(),
+        "jobs": jobs,
+        "now_utc": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 # Kick off the scheduler at module import time so it runs under gunicorn.
